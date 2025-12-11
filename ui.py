@@ -1,4 +1,6 @@
+
 import base64
+import re
 import streamlit as st
 from datetime import datetime
 from scrape import scrape_multiple
@@ -16,6 +18,43 @@ def cached_search_results(refined_query: str, threads: int):
 @st.cache_data(ttl=200, show_spinner=False)
 def cached_scrape_multiple(filtered: list, threads: int):
     return scrape_multiple(filtered, max_workers=threads)
+
+
+def scrape_with_progress(filtered: list, threads: int, status_container, progress_container):
+    """
+    Scrape URLs with live progress updates in Streamlit.
+    """
+    progress_logs = []
+    progress_bar = progress_container.progress(0, text="Starting scrape...")
+    url_status = progress_container.empty()
+
+    def progress_callback(url, status, current, total):
+        # Show full URL (don't truncate)
+        display_url = url
+
+        # Status emoji
+        emoji = {"success": "✅", "failed": "⚠️", "error": "❌", "checking": "🔍"}.get(status, "📜")
+
+        # Update progress bar
+        progress = current / total if total > 0 else 0
+        progress_bar.progress(progress, text=f"Scraping {current}/{total} URLs...")
+
+        # Update status display with full URL
+        progress_logs.append(f"{emoji} `{display_url}`")
+        # Show last 5 URLs
+        recent = progress_logs[-5:] if len(progress_logs) > 5 else progress_logs
+        url_status.markdown("**Recent:**\n" + "\n".join(f"- {log}" for log in recent))
+
+    # Run scraping with callback
+    results = scrape_multiple(filtered, max_workers=threads, progress_callback=progress_callback)
+
+    # Final update
+    success_count = sum(1 for url, content in results.items()
+                       if any(len(content) > len(f.get('title', '')) + 10
+                             for f in filtered if f.get('link') == url))
+    progress_bar.progress(1.0, text=f"✅ Scraping complete: {len(results)} URLs processed")
+
+    return results
 
 
 # Streamlit page configuration
@@ -59,6 +98,7 @@ st.sidebar.markdown(
 )
 st.sidebar.subheader("Settings")
 model_options = get_model_choices()
+
 default_model_index = (
     next(
         (idx for idx, name in enumerate(model_options) if name.lower() == "gpt4o"),
@@ -145,12 +185,13 @@ if run_button and query:
         unsafe_allow_html=True,
     )
 
-    # Stage 5 - Scrape content
+    # Stage 5 - Scrape content with live progress
     with status_slot.container():
-        with st.spinner("📜 Scraping content..."):
-            st.session_state.scraped = cached_scrape_multiple(
-                st.session_state.filtered, threads
-            )
+        st.markdown("📜 **Scraping content...**")
+        scrape_progress = st.container()
+        st.session_state.scraped = scrape_with_progress(
+            st.session_state.filtered, threads, status_slot, scrape_progress
+        )
 
     # Stage 6 - Summarize
     # 6a) Prepare session state for streaming text
@@ -167,12 +208,21 @@ if run_button and query:
             st.subheader(":red[Investigation Summary]", anchor=None, divider="gray")
         summary_slot = st.empty()
 
-    # 6d) Inject your two callbacks and invoke exactly as before
+    # 6d) Generate summary - handle both streaming and non-streaming models
     with status_slot.container():
         with st.spinner("✍️ Generating summary..."):
-            stream_handler = BufferedStreamingHandler(ui_callback=ui_emit)
-            llm.callbacks = [stream_handler]
-            _ = generate_summary(llm, query, st.session_state.scraped)
+            # Try streaming for non-Bedrock models
+            if 'bedrock' not in model.lower():
+                stream_handler = BufferedStreamingHandler(ui_callback=ui_emit)
+                llm.callbacks = [stream_handler]
+
+            # Generate summary and capture result
+            summary_result = generate_summary(llm, query, st.session_state.scraped)
+
+            # For Bedrock (non-streaming), display the full result
+            if not st.session_state.streamed_summary and summary_result:
+                st.session_state.streamed_summary = summary_result
+                summary_slot.markdown(summary_result)
 
     with btn_col:
         now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
